@@ -1,0 +1,43 @@
+name: Daily Radio News + Lines
+
+# Fires at 06:00 and 07:00 UTC. post.py reads UK local time itself and sends on
+# the first run landing 07:00-12:59 UK, so the bulletin arrives at 7 AM UK all
+# year round (DST-safe) AND still goes out if GitHub delays a scheduled run.
+#
+# Exactly one send per day is guaranteed by a "sent today" marker committed to
+# state/last_sent.txt - the second run of the day sees the marker and skips.
+#
+# Delivery: a Telegram DM to Chris, plus an emailed copy via Gmail SMTP.
+on:
+  schedule:
+    - cron: "0 6,7 * * *"
+  workflow_dispatch:
+    inputs:
+      skip_email:
+        description: "Skip the emailed copy (tests only)"
+        type: boolean
+        default: false
+
+# Needed so post.py can write the sent-today marker back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the daily news bulletin
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SKIP_EMAIL: ${{ github.event.inputs.skip_email == 'true' && '1' || '0' }}
+          # "1" lets a manual test run fire outside the window; scheduled runs are gated.
+          ALLOW_ANY_HOUR: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+        run: python3 post.py
