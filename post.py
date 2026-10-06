@@ -246,6 +246,19 @@ like a newsreader or a press release.
 Below are today's real headlines. Pick the FIVE best stories for him to talk about \
 on air today, and write them up.
 
+THE RULE ABOVE ALL OTHERS - AUTHENTICITY. Every line must sound like something he \
+would actually say out loud to ONE listener, sitting in a studio, on a Saturday. \
+Follow this priority order, in order:
+1. AUTHENTICITY FIRST - it has to sound like him, speaking naturally. If a line \
+would not come out of his mouth, it is worthless no matter how clever it is.
+2. HUMOUR - if there is a colourful or interesting way to say it, say it that way. \
+Add a humorous line wherever one genuinely fits - but never force one.
+3. HUMAN CONNECTION - believable observations, real-life situations, genuine warmth.
+4. INTERESTING CONTENT - a good story, a telling detail, a memory, an observation.
+The overall brief: colourful, engaging and humorous, but ALWAYS believable as \
+something he'd really say on the radio. Never "writerly", never like an ad, never \
+like a press release.
+
 TOP PRIORITY - KEEP IT LIGHT. This outranks everything else:
 - NO war, military, defence, missiles, drones, terrorism, or foreign affairs.
 - NO party politics, elections, campaigns, budgets, or political rows.
@@ -266,6 +279,13 @@ or details. If a headline is thin, keep the write-up thin.
 well-known showbiz or music figure people will want to talk about.
 - No two stories from the same area. Cover five DIFFERENT areas.
 - No fake enthusiasm, no cheesy gags. Wit over jokes. Dry over slapstick.
+- FIRST-PERSON LINES: an everyday hypothetical or general preference is welcome \
+("I'd just grow cacti instead", "I can't get £277 for my shopping-list notebook", \
+"that tops being clipped by the printer"). But NEVER invent a specific claim about \
+his life, his family, his past, or things he has supposedly done or places he has \
+supposedly been. No "my mum...", no "my dad's...", no "when I was...", no \
+"I once...", no "I remember...". He has to be able to say every line truthfully \
+on air, so keep first-person general and never biographical.
 - NO questions to the listener, NO calls to action.
 - Plain hyphens only (-). NEVER use em dashes or en dashes.
 - No markdown, no bold markers, no bullet symbols, no headings like "STORY 1:".
@@ -275,10 +295,13 @@ context, no background, no scene-setting.
 
 VOICE CALIBRATION for the "~" lines. They must sound like something he would \
 actually say out loud to one listener - understated, warm, specific. Good: \
-"£1 million to fix a greenhouse. My dad's been trying to fix his lean-to for a \
-decade with gaffer tape and sheer hope, so I feel their pain." Bad (too writerly, \
-too jokey): "Hold onto your watering cans, folks!" Any line that reads like a press \
-release or a stand-up punchline fails. Specific detail beats a generic gag every time.
+"£66 million for a greenhouse. Mine cost £40 in B&Q and it's still standing, so \
+I'm not sure what they're doing differently." Bad (too writerly, too jokey): \
+"Hold onto your watering cans, folks!" Bad (a fabricated personal anecdote he \
+cannot truthfully say): "My dad's been fixing his lean-to for a decade." Any line \
+that reads like a press release or a stand-up punchline fails. Specific detail \
+beats a generic gag every time - the detail just has to be about the STORY, not \
+about his life.
 
 OUTPUT FORMAT - exactly this, nothing before or after:
 
@@ -399,6 +422,33 @@ def split_stories(body):
         blocks = re.split(r"\n(?=\d+\.\s+[A-Z])", body)
         blocks = [b.strip() for b in blocks if b.strip()]
     return blocks
+
+
+# Fabricated autobiography: the model likes inventing "my mum..." / "I once..."
+# lines. Chris has to be able to say every line truthfully on air, so any option
+# line making a specific claim about his life or family is dropped.
+CLAIM_LINES = re.compile(
+    r"(\bmy\s+(?:mum|dad|mother|father|wife|husband|girlfriend|partner|son|"
+    r"daughter|kid|kids|child|children|brother|sister|nan|gran|grandma|grandad|"
+    r"aunt|uncle|cousin|neighbour|neighbours|mate|mates|mother-in-law)\b"
+    r"|\bI\s+(?:once|used to|remember|grew up|went to|visited|drove|bought|paid"
+    r"|spent|tried|had to)\b"
+    r"|\bwhen I was\b|\bback in my\b)",
+    re.IGNORECASE,
+)
+
+
+def scrub_claims(body):
+    """Drop option lines that invent a specific claim about Chris's own life."""
+    out, dropped = [], []
+    for line in body.split("\n"):
+        if line.strip().startswith("~") and CLAIM_LINES.search(line):
+            dropped.append(line.strip()[:80])
+            continue
+        out.append(line)
+    for d in dropped:
+        log(f"  dropped invented personal claim: {d}")
+    return "\n".join(out)
 
 
 def trim_summary(block):
@@ -577,6 +627,7 @@ def main():
     body = clean_body(call_llm(items))
     body = drop_heavy_blocks(body)
     body = apply_brief(body)
+    body = scrub_claims(body)
     short = [b for b in split_stories(body) if len([l for l in b.split("\n") if l.strip().startswith("~")]) < 2]
     if short:
         log(f"  WARNING: {len(short)} story/stories came back with fewer than 2 option lines")
