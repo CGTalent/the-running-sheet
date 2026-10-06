@@ -275,6 +275,14 @@ records, weather, and everyday-life surprises.
 OTHER HARD RULES:
 - Use ONLY the facts in the headlines below. Never invent names, numbers, quotes \
 or details. If a headline is thin, keep the write-up thin.
+- GEOGRAPHY DOES NOT MATTER MUCH. A story about a musician, a concert, a TV show, \
+a film or a sporting event is just as usable wherever it happened - do not rule \
+stories out for not being local to him. If ONE of the headlines is genuinely \
+London or South West London in a way that is interesting to talk about (Kingston, \
+Teddington, Surbiton, Wimbledon, Richmond, Twickenham, Hampton Court, Croydon, \
+Brixton, and so on), prefer it for ONE story - but never force it, and never pick \
+a local story that is dull just to have one. Never mention the geography rule in \
+your output.
 - AT MOST ONE story about a death or obituary, and only if it is a genuinely \
 well-known showbiz or music figure people will want to talk about.
 - No two stories from the same area. Cover five DIFFERENT areas.
@@ -303,9 +311,11 @@ that reads like a press release or a stand-up punchline fails. Specific detail \
 beats a generic gag every time - the detail just has to be about the STORY, not \
 about his life.
 
-OUTPUT FORMAT - exactly this, nothing before or after:
+OUTPUT FORMAT - exactly this, nothing before or after. The number in square \
+brackets MUST be the item number of the headline you used from TODAY'S HEADLINES \
+below - it is how the story's link gets attached, so it has to be the right one:
 
-1. HEADLINE IN CAPITAL LETTERS
+1. [12] HEADLINE IN CAPITAL LETTERS
 One or two short sentences saying what happened, conversationally.
 
 ~ "An optional line he could say - a dry punchline."
@@ -314,11 +324,12 @@ One or two short sentences saying what happened, conversationally.
 
 ---
 
-2. NEXT HEADLINE IN CAPITALS
+2. [7] NEXT HEADLINE IN CAPITALS
 Summary sentence.
 
 ~ "Option one."
 ~ "Option two."
+~ "Option three."
 
 ---
 
@@ -383,8 +394,12 @@ def drop_heavy_blocks(body):
     blocks = split_stories(body)
     kept, dropped = [], []
     for b in blocks:
-        if HEAVY_TERMS.search(b):
-            dropped.append(b.split("\n", 1)[0][:70])
+        # Judge the STORY (headline + summary), not the joke lines - a stray word
+        # in a punchline should never knock out a perfectly good light story.
+        head_part = b.split("~", 1)[0]
+        hit = HEAVY_TERMS.search(head_part)
+        if hit:
+            dropped.append(f"{b.split(chr(10), 1)[0][:70]}  [matched: {hit.group(0)!r}]")
         else:
             kept.append(b)
     if dropped:
@@ -473,6 +488,63 @@ def apply_brief(body):
     """Rebuild the body with every story's summary trimmed to two sentences."""
     blocks = [trim_summary(b) for b in split_stories(body)]
     return "\n\n---\n\n".join(b.strip() for b in blocks if b.strip())
+
+
+def linkify(body, items):
+    """Attach the source article link to every story.
+
+    The prompt makes the model tag each story with the list number it used
+    ('2. [17] HEADLINE'); we map that back to the real URL. If the model mangles
+    the tag, fall back to matching the headline against the pool by word overlap.
+    """
+    by_index = {i: it for i, it in enumerate(items, 1)}
+    out = []
+    for pos, block in enumerate(split_stories(body), 1):
+        lines = block.split("\n")
+        link = None
+        m = re.match(r"^(\d+)\.\s*\[(\d+)\]\s*(.*)$", lines[0])
+        if m:
+            idx = int(m.group(2))
+            if idx in by_index:
+                link = by_index[idx]["link"]
+            body_line = m.group(3).strip()
+        else:
+            body_line = re.sub(r"^\d+\.\s*", "", lines[0]).strip()
+        # Renumber sequentially, so dropping a story never leaves a gap (1,2,4,5).
+        lines[0] = f"{pos}. {body_line}"
+        if not link:
+            link = fuzzy_link(body_line, items)
+        if link:
+            lines += ["", f"Link: {link}"]
+        out.append("\n".join(lines).strip())
+    return "\n\n---\n\n".join(out)
+
+
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as",
+    "at", "is", "are", "was", "were", "after", "over", "new", "says", "said",
+    "its", "his", "her", "their", "from", "by", "that", "this", "it's", "amid",
+    "into", "up", "out", "as", "be", "been", "will", "has", "have", "had",
+}
+
+
+def fuzzy_link(headline, items, threshold=0.34):
+    """Best-effort fallback: match a story headline to its source item."""
+    def toks(s):
+        return {w for w in re.findall(r"[a-z']+", s.lower())
+                if w not in STOPWORDS and len(w) > 2}
+    ht = toks(headline)
+    if not ht:
+        return None
+    best, best_score = None, 0.0
+    for it in items:
+        score = len(ht & toks(it["title"])) / len(ht)
+        if score > best_score:
+            best, best_score = it, score
+    if best and best_score >= threshold:
+        log(f"  link matched by headline guess ({best_score:.2f}): {best['title'][:60]}")
+        return best["link"]
+    return None
 
 
 def build_message(body, uk_date, opener):
@@ -628,6 +700,9 @@ def main():
     body = drop_heavy_blocks(body)
     body = apply_brief(body)
     body = scrub_claims(body)
+    body = linkify(body, items)
+    if not all("Link: " in b for b in split_stories(body)):
+        log("  WARNING: at least one story came back without a link")
     short = [b for b in split_stories(body) if len([l for l in b.split("\n") if l.strip().startswith("~")]) < 2]
     if short:
         log(f"  WARNING: {len(short)} story/stories came back with fewer than 2 option lines")
@@ -642,8 +717,11 @@ def main():
         return
 
     log("Sending Telegram DM...")
-    mid = send_telegram(message)
-    log(f"  OK Telegram DM sent (message_id={mid})")
+    if os.environ.get("SKIP_TELEGRAM") == "1":
+        log("  Telegram skipped (SKIP_TELEGRAM=1)")
+    else:
+        mid = send_telegram(message)
+        log(f"  OK Telegram DM sent (message_id={mid})")
 
     # Email is a bonus copy: never let it duplicate the Telegram DM, so record
     # the marker regardless, but exit non-zero so a broken mail path shows red
