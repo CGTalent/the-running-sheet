@@ -48,18 +48,66 @@ STORIES = 5
 # A spread of UK feeds. Each is tried independently; a dead feed is skipped,
 # never fatal. London feed gives the local (Chris is Radio Jackie, SW London).
 NEWS_FEEDS = [
-    ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
-    ("BBC UK", "https://feeds.bbci.co.uk/news/uk/rss.xml"),
-    ("BBC London", "https://feeds.bbci.co.uk/news/england/london/rss.xml"),
-    ("BBC Politics", "https://feeds.bbci.co.uk/news/politics/rss.xml"),
     ("BBC Entertainment", "https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml"),
     ("BBC Sport", "https://feeds.bbci.co.uk/sport/rss.xml"),
-    ("Sky News UK", "https://feeds.skynews.com/feeds/rss/uk.xml"),
+    ("BBC London", "https://feeds.bbci.co.uk/news/england/london/rss.xml"),
+    ("Sky Entertainment", "https://feeds.skynews.com/feeds/rss/entertainment.xml"),
     ("Sky News Strange", "https://feeds.skynews.com/feeds/rss/strange.xml"),
-    ("Sky News Entertainment", "https://feeds.skynews.com/feeds/rss/entertainment.xml"),
-    ("Guardian UK", "https://www.theguardian.com/uk/rss"),
+    ("Guardian Culture", "https://www.theguardian.com/culture/rss"),
+    ("Guardian TV & Radio", "https://www.theguardian.com/tv-and-radio/rss"),
+    ("Guardian Life & Style", "https://www.theguardian.com/lifeandstyle/rss"),
+    ("Guardian Music", "https://www.theguardian.com/music/rss"),
     ("Guardian Sport", "https://www.theguardian.com/uk/sport/rss"),
+    ("NME Music", "https://www.nme.com/news/music/feed"),
+    ("Rolling Stone UK", "https://www.rollingstone.co.uk/feed/"),
+    ("Radio Times", "https://www.radiotimes.com/feed/"),
 ]
+
+# Chris's show is light and entertainment-led - he is not there to deliver the
+# news. Anything heavy, serious, political or upsetting is banned, and the ban is
+# enforced HERE in code (a prompt instruction alone is not reliable). These terms
+# are checked against each headline before the model ever sees it, and again
+# against the finished stories as a safety net.
+HEAVY_TERMS = re.compile(
+    r"\b(" + "|".join([
+        # war / military / foreign affairs
+        "war", "wars", "warfare", "military", "armed forces", "army", "navy", "raf",
+        "air force", "missile", "missiles", "drone", "drones", "bomber", "bombers",
+        "fighter jet", "nato", "nuclear", "ceasefire", "invasion", "troops",
+        "airstrike", "air strike", "hostage", "hostages", "terror", "terrorist",
+        "terrorism", "terror attack", "geopolitics", "geopolitical", "sanctions",
+        "putin", "kremlin", "ukraine", "russia", "iran", "israel", "gaza", "hamas",
+        "hezbollah", "lebanon", "taiwan", "north korea", "pentagon", "white house",
+        # politics / elections
+        "election", "elections", "ballot", "by-election", "byelection", "parliament",
+        "westminster", "mp", "mps", "tory", "tories", "conservative party",
+        "labour party", "reform uk", "lib dem", "lib dems", "snp", "badenoch",
+        "farage", "starmer", "burnham", "chancellor", "budget", "manifesto",
+        "polling", "opinion poll",
+        # crime / courts / violence / tragedy
+        "police", "arrest", "arrested", "charged", "court", "trial", "jailed",
+        "prison", "sentence", "murder", "manslaughter", "assault", "abuse", "rape",
+        "sexual", "paedophile", "grooming", "stab", "stabbing", "shooting",
+        "shot dead", "killed", "fatal", "inquest", "tragedy", "tragic", "suicide",
+        "overdose", "attacked", "victim",
+        # grim money / health / misery
+        "inflation", "recession", "mortgage", "interest rates", "cost of living",
+        "unemployment", "redundancies", "redundancy", "job cuts", "layoffs",
+        "nhs", "hospital", "cancer", "terminal illness", "ambulance", "flood",
+        "floods", "storm damage", "crisis", "strike action", "industrial action",
+        "walkout", "protest", "protesters", "riot", "riots", "migrant", "migrants",
+        "asylum", "immigration", "deportation", "small boats",
+        # hatred / extremism
+        "racism", "racist", "far-right", "extremist", "extremism", "antisemitic",
+        "antisemitism", "islamophobia", "hate crime",
+    ]) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_heavy(item):
+    """True if a headline/summary trips the heavy-topic filter."""
+    return bool(HEAVY_TERMS.search(f"{item['title']} {item['summary']}"))
 
 # Rotating openers, picked by calendar day so every morning starts slightly
 # differently. Keep in code - never let the model write this line.
@@ -72,13 +120,13 @@ OPENERS = [
     "Hello, Chris \U0001F3A4",
     "Morning, Chris \U0001F4F0",
 ]
-SUBLINE = "Five things doing the rounds today - and a few lines you could use."
+SUBLINE = "{n} things doing the rounds today - and a few lines you could use."
+NUM_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
 
 FRAME_TOP = "=" * 4
 FRAME_BOTTOM = "=" * 4
 RULE = "=" * 44
 DIVIDER = "-" * 44
-CLOSER = "That's your five. Take what you like, bin the rest."
 
 # Hard content rules the model keeps ignoring - enforce in code as well.
 BANNED_LINE = re.compile(r"^\s*(?:#{1,6}\s|\*\*|[-*]\s+\[|bullet:)", re.IGNORECASE)
@@ -152,11 +200,12 @@ def fetch_feed(name, url, per_feed=12):
 
 def get_headlines():
     """All feeds merged round-robin (so the first N span every source, not just
-    the first feed or two), de-duplicated by title."""
+    the first feed or two), de-duplicated by title, with anything heavy dropped
+    before the model ever sees it."""
     per_feed = []
     for name, url in NEWS_FEEDS:
         per_feed.append(fetch_feed(name, url))
-    seen, merged = set(), []
+    seen, merged, dropped = set(), [], 0
     for i in range(max((len(f) for f in per_feed), default=0)):
         for feed in per_feed:
             if i >= len(feed):
@@ -166,7 +215,11 @@ def get_headlines():
             if key in seen:
                 continue
             seen.add(key)
+            if is_heavy(item):
+                dropped += 1
+                continue
             merged.append(item)
+    log(f"  {dropped} heavy/serious headlines filtered out")
     return merged
 
 
@@ -183,23 +236,35 @@ def headlines_blob(items, limit=40):
 # --------------------------------------------------------------------------
 # LLM
 # --------------------------------------------------------------------------
-PROMPT = """You write daily news notes for Chris Farrell, a UK radio presenter \
-(Radio Jackie, South West London, and Greatest Hits Radio 80s). His style: \
-REALLY AUTHENTIC, REALLY CONVERSATIONAL, warm, understated, dry-witted. Sounds \
-like a mate chatting, never like a newsreader or a press release.
+PROMPT = """You write the daily light-entertainment brief for Chris Farrell, a UK \
+radio presenter (Radio Jackie, South West London, and Greatest Hits Radio 80s). His \
+show is LIGHT, ENTERTAINING and CONVERSATIONAL. He is there to amuse people and \
+keep them company - he is NOT a newsreader. His style: REALLY AUTHENTIC, REALLY \
+CONVERSATIONAL, warm, understated, dry-witted. Sounds like a mate chatting, never \
+like a newsreader or a press release.
 
-Below are today's real headlines. Pick the FIVE best stories for a presenter to \
-talk about on air today, and write them up.
+Below are today's real headlines. Pick the FIVE best stories for him to talk about \
+on air today, and write them up.
 
-HARD RULES:
-- Use ONLY the facts in the headlines below. Never invent names, numbers, \
-quotes or details. If a headline is thin, keep the write-up thin.
-- AT MOST ONE story about a death or obituary. One is fine if it is a genuine \
-talking point; two out of five makes the whole bulletin gloomy.
-- No two stories from the same area. Cover five DIFFERENT areas (e.g. UK news, \
-politics, showbiz/music/TV, sport, quirky or heartwarming).
-- Skip anything gratuitously grim: deaths of private individuals, court cases \
-involving children, graphic violence, sexual offences, suicide.
+TOP PRIORITY - KEEP IT LIGHT. This outranks everything else:
+- NO war, military, defence, missiles, drones, terrorism, or foreign affairs.
+- NO party politics, elections, campaigns, budgets, or political rows.
+- NO crime, courts, arrests, sentencing, violence, abuse or tragedy.
+- NO grim money talk, cost-of-living misery, recession or job losses.
+- NOTHING distressing on any subject. If a story has a sad or frightening angle, \
+skip it and pick another instead.
+- If a story could open a proper news bulletin, it is the WRONG story for him.
+- DO pick the light, current things people are actually chatting about: showbiz and \
+celebrity, music, TV and film, sport, funny or heartwarming or quirky stories, \
+local London and South West London life, animals, food, nostalgia, odd auctions, \
+records, weather, and everyday-life surprises.
+
+OTHER HARD RULES:
+- Use ONLY the facts in the headlines below. Never invent names, numbers, quotes \
+or details. If a headline is thin, keep the write-up thin.
+- AT MOST ONE story about a death or obituary, and only if it is a genuinely \
+well-known showbiz or music figure people will want to talk about.
+- No two stories from the same area. Cover five DIFFERENT areas.
 - No fake enthusiasm, no cheesy gags. Wit over jokes. Dry over slapstick.
 - NO questions to the listener, NO calls to action.
 - Plain hyphens only (-). NEVER use em dashes or en dashes.
@@ -208,10 +273,10 @@ involving children, graphic violence, sexual offences, suicide.
 
 VOICE CALIBRATION for the "~" lines. They must sound like something he would \
 actually say out loud to one listener - understated, warm, specific. Good: \
-"£1 million to fix a greenhouse. My mum's had a leaking conservatory since 2011 \
-and she's still using a bucket." Bad (too writerly, too jokey): "Hold onto your \
-watering cans, folks!" Any line that reads like a press release or a stand-up \
-punchline fails. Specific detail beats a generic gag every time.
+"£1 million to fix a greenhouse. My dad's been trying to fix his lean-to for a \
+decade with gaffer tape and sheer hope, so I feel their pain." Bad (too writerly, \
+too jokey): "Hold onto your watering cans, folks!" Any line that reads like a press \
+release or a stand-up punchline fails. Specific detail beats a generic gag every time.
 
 OUTPUT FORMAT - exactly this, nothing before or after:
 
@@ -237,8 +302,7 @@ Summary sentence.
 Give 2-3 "~" option lines per story. Vary their flavour: some dry punchlines, \
 some plain authentic observations, some warm or thoughtful closers, occasionally \
 a colourful comparison. They are options - Chris picks one or says none. Do not \
-force a joke into every one. Under each political story, prefer a neutral, \
-non-partisan angle.
+force a joke into every one.
 
 TODAY'S HEADLINES
 =================
@@ -287,6 +351,22 @@ def call_llm(items, attempts=3):
 # --------------------------------------------------------------------------
 # Format the message
 # --------------------------------------------------------------------------
+def drop_heavy_blocks(body):
+    """Safety net: drop any finished story block that still trips the heavy
+    filter, so a serious story can never reach Chris's phone."""
+    blocks = split_stories(body)
+    kept, dropped = [], []
+    for b in blocks:
+        if HEAVY_TERMS.search(b):
+            dropped.append(b.split("\n", 1)[0][:70])
+        else:
+            kept.append(b)
+    if dropped:
+        for d in dropped:
+            log(f"  dropped heavy story: {d}")
+    return f"\n\n---\n\n".join(kept)
+
+
 def clean_body(text):
     """Normalise spacing and enforce the hard formatting rules."""
     text = text.replace("\u2014", "-").replace("\u2013", "-")  # em/en dash -> hyphen
@@ -320,17 +400,19 @@ def split_stories(body):
 
 def build_message(body, uk_date, opener):
     blocks = split_stories(body)
+    n = len(blocks) or STORIES
+    word = NUM_WORDS.get(n, str(n)).capitalize()
     body_txt = f"\n\n{DIVIDER}\n\n".join(blocks)
     return (
         f"{FRAME_TOP}\n"
         f"{opener}\n"
-        f"{SUBLINE}\n\n"
+        f"{SUBLINE.format(n=word)}\n\n"
         f"\U0001F4F0 THE RUNNING SHEET\n"
         f"{uk_date}\n"
         f"{RULE}\n\n"
         f"{body_txt}\n\n"
         f"{RULE}\n"
-        f"{CLOSER}\n"
+        f"That's your {NUM_WORDS.get(n, str(n))}. Take what you like, bin the rest.\n"
         f"{FRAME_BOTTOM}"
     )
 
@@ -466,6 +548,7 @@ def main():
 
     log("Asking the model for five stories...")
     body = clean_body(call_llm(items))
+    body = drop_heavy_blocks(body)
 
     opener = OPENERS[now_uk.toordinal() % len(OPENERS)]
     message = build_message(body, uk_date, opener)
