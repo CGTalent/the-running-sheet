@@ -1,4 +1,4 @@
-name: Daily Radio News + Lines
+name: The Running Sheet
 
 # Fires at 06:00 and 07:00 UTC. post.py reads UK local time itself and sends on
 # the first run landing 07:00-12:59 UK, so the bulletin arrives at 7 AM UK all

@@ -325,7 +325,7 @@ def build_message(body, uk_date, opener):
         f"{FRAME_TOP}\n"
         f"{opener}\n"
         f"{SUBLINE}\n\n"
-        f"\U0001F4F0 WHAT'S GOING ON TODAY\n"
+        f"\U0001F4F0 THE RUNNING SHEET\n"
         f"{uk_date}\n"
         f"{RULE}\n\n"
         f"{body_txt}\n\n"
@@ -375,7 +375,7 @@ def send_email(message, uk_date):
         log("  email skipped (no EMAIL_ADDRESS / EMAIL_PASSWORD)")
         return None
     msg = MIMEText(message, "plain", "utf-8")
-    msg["Subject"] = f"\U0001F399 Today's news + lines for radio - {uk_date}"
+    msg["Subject"] = f"\U0001F399 The Running Sheet - {uk_date}"
     msg["From"] = addr
     msg["To"] = to
     msg["Date"] = formatdate(localtime=True)
@@ -399,7 +399,7 @@ def _gh_headers():
 
 
 def _repo():
-    return os.environ.get("GITHUB_REPOSITORY", "CGTalent/daily-radio-news")
+    return os.environ.get("GITHUB_REPOSITORY", "CGTalent/the-running-sheet")
 
 
 def _read_marker():
