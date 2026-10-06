@@ -269,7 +269,9 @@ well-known showbiz or music figure people will want to talk about.
 - NO questions to the listener, NO calls to action.
 - Plain hyphens only (-). NEVER use em dashes or en dashes.
 - No markdown, no bold markers, no bullet symbols, no headings like "STORY 1:".
-- Keep each summary to one or two SHORT sentences.
+- Keep each summary to ONE sentence, TWO at the very most - never three. It is \
+only there to set up his link, so give just enough detail to make sense. No extra \
+context, no background, no scene-setting.
 
 VOICE CALIBRATION for the "~" lines. They must sound like something he would \
 actually say out loud to one listener - understated, warm, specific. Good: \
@@ -299,10 +301,11 @@ Summary sentence.
 
 (and so on for all five)
 
-Give 2-3 "~" option lines per story. Vary their flavour: some dry punchlines, \
-some plain authentic observations, some warm or thoughtful closers, occasionally \
-a colourful comparison. They are options - Chris picks one or says none. Do not \
-force a joke into every one.
+Give exactly THREE "~" option lines for every story - he wants a choice. Vary \
+their flavour: one dry punchline, one plain authentic observation, one warm or \
+thoughtful closer or colourful comparison. They are options - Chris picks one, \
+or says none. Do not force a joke into every one, and never use the same shape \
+twice in the same story.
 
 TODAY'S HEADLINES
 =================
@@ -396,6 +399,30 @@ def split_stories(body):
         blocks = re.split(r"\n(?=\d+\.\s+[A-Z])", body)
         blocks = [b.strip() for b in blocks if b.strip()]
     return blocks
+
+
+def trim_summary(block):
+    """Keep each story's setup to at most TWO sentences - Chris only needs enough
+    to set up his link. Deterministic trim, so it cannot regress."""
+    head, sep, rest = block.partition("\n")
+    if not sep:
+        return block
+    idx = rest.find("~")
+    if idx == -1:
+        return block
+    summary, tail = rest[:idx], rest[idx:]
+    sentences = re.split(r"(?<=[.!?])\s+", summary.strip())
+    if len(sentences) > 2:
+        summary = " ".join(sentences[:2])
+    else:
+        summary = summary.strip()
+    return f"{head}\n{summary}\n\n{tail.lstrip()}"
+
+
+def apply_brief(body):
+    """Rebuild the body with every story's summary trimmed to two sentences."""
+    blocks = [trim_summary(b) for b in split_stories(body)]
+    return "\n\n---\n\n".join(b.strip() for b in blocks if b.strip())
 
 
 def build_message(body, uk_date, opener):
@@ -549,6 +576,10 @@ def main():
     log("Asking the model for five stories...")
     body = clean_body(call_llm(items))
     body = drop_heavy_blocks(body)
+    body = apply_brief(body)
+    short = [b for b in split_stories(body) if len([l for l in b.split("\n") if l.strip().startswith("~")]) < 2]
+    if short:
+        log(f"  WARNING: {len(short)} story/stories came back with fewer than 2 option lines")
 
     opener = OPENERS[now_uk.toordinal() % len(OPENERS)]
     message = build_message(body, uk_date, opener)
