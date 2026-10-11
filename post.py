@@ -42,7 +42,10 @@ MODEL = os.environ.get("NEWS_MODEL", "deepseek/deepseek-v4-flash-0731")
 
 MARKER_PATH = "state/last_sent.txt"
 TARGET_HOUR = 7          # 7 AM UK
-WINDOW_END_HOUR = 12     # accept any run landing 07:00-12:59 UK
+WINDOW_END_HOUR = 18     # accept any run landing 07:00-18:59 UK
+                         # (GitHub can delay a scheduled run by hours; a late
+                         #  bulletin beats no bulletin. The sent-today marker
+                         #  still guarantees exactly one send per day.)
 STORIES = 5
 
 # A spread of UK feeds. Each is tried independently; a dead feed is skipped,
