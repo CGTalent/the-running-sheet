@@ -24,9 +24,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.text import MIMEText
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 
 try:
     from zoneinfo import ZoneInfo
@@ -41,12 +41,19 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = os.environ.get("NEWS_MODEL", "deepseek/deepseek-v4-flash-0731")
 
 MARKER_PATH = "state/last_sent.txt"
+HISTORY_PATH = "state/history.json"
 TARGET_HOUR = 7          # 7 AM UK
 WINDOW_END_HOUR = 18     # accept any run landing 07:00-18:59 UK
                          # (GitHub can delay a scheduled run by hours; a late
                          #  bulletin beats no bulletin. The sent-today marker
                          #  still guarantees exactly one send per day.)
 STORIES = 5
+
+# Anti-repetition. RSS feeds keep listing a story for days (even weeks), so
+# without these two guards the same quirky story gets picked over and over.
+MAX_AGE_HOURS = 72       # a story must have been published in the last 3 days
+REPEAT_WINDOW_DAYS = 45  # never reuse a story already used in this many days
+HISTORY_KEEP_DAYS = 90   # how long to keep entries in state/history.json
 
 # A spread of UK feeds. Each is tried independently; a dead feed is skipped,
 # never fatal. London feed gives the local (Chris is Radio Jackie, SW London).
@@ -169,8 +176,50 @@ def _text(node):
     return (node.text or "").strip() if node is not None else ""
 
 
+def _item_pubdate(it):
+    """Raw publication-date string from an RSS/Atom item, or ''.
+
+    NOTE: ElementTree elements are falsy when they have no children, so
+    `it.find("pubDate") or it.find(...)` silently skips a perfectly good
+    date. Always test `is not None`.
+    """
+    for tag in ("pubDate",
+                "{http://www.w3.org/2005/Atom}published",
+                "{http://www.w3.org/2005/Atom}updated",
+                "{http://purl.org/dc/elements/1.1/}date"):
+        node = it.find(tag)
+        if node is not None and (node.text or "").strip():
+            return node.text.strip()
+    return ""
+
+
+def parse_pubdate(s):
+    """Parse an RSS/Atom date string into an aware datetime, or None."""
+    if not s:
+        return None
+    try:
+        d = parsedate_to_datetime(s)
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def item_age_hours(item):
+    """Hours since the story was published, or None if undated."""
+    d = parse_pubdate(item.get("pub", ""))
+    if d is None:
+        return None
+    return (datetime.now(timezone.utc) - d).total_seconds() / 3600.0
+
+
 def fetch_feed(name, url, per_feed=12):
-    """Return a list of {source,title,summary,link} from one RSS feed."""
+    """Return a list of {source,title,summary,link,pub} from one RSS feed,
+    newest first."""
     raw = http_get(url)
     if not raw:
         log(f"  feed skipped (no response): {name}")
@@ -196,19 +245,145 @@ def fetch_feed(name, url, per_feed=12):
             ln = it.find("{http://www.w3.org/2005/Atom}link")
             link = ln.get("href") if ln is not None else ""
         out.append({"source": name, "title": html.unescape(title).strip(),
-                    "summary": desc[:220], "link": link})
+                    "summary": desc[:220], "link": link,
+                    "pub": _item_pubdate(it)})
+    # Newest first, so the round-robin merge is freshest-first. Undated items
+    # sink to the bottom rather than being trusted as current.
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    out.sort(key=lambda x: parse_pubdate(x["pub"]) or epoch, reverse=True)
     log(f"  {name}: {len(out)} items")
     return out
 
 
-def get_headlines():
+# --------------------------------------------------------------------------
+# Used-story history (anti-repetition)
+# --------------------------------------------------------------------------
+HISTORY_STOPWORDS = {
+    "the", "and", "for", "with", "from", "that", "this", "his", "her", "its",
+    "after", "over", "into", "about", "says", "said", "new", "out", "are",
+    "was", "has", "had", "not", "but", "you", "your", "who", "why", "how",
+}
+
+
+def title_key(title):
+    """Normalised key for a headline - punctuation/spacing/case insensitive."""
+    return re.sub(r"\W+", "", (title or "").lower())[:80]
+
+
+def _tokens(title):
+    return {w for w in re.findall(r"[a-z0-9]+", (title or "").lower())
+            if len(w) > 2 and w not in HISTORY_STOPWORDS}
+
+
+def _similar(a, b):
+    """True if two headlines describe the same story. Feeds reword headlines,
+    so an exact key match alone is not enough."""
+    if title_key(a) == title_key(b):
+        return True
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / len(ta | tb) >= 0.5
+
+
+def is_repeat(item, history):
+    """True if this headline was already used in a previous bulletin."""
+    for h in history:
+        if h.get("link") and item.get("link") and h["link"] == item["link"]:
+            return True
+        if _similar(item["title"], h.get("title", "")):
+            return True
+    return False
+
+
+def load_history():
+    """Read state/history.json via the GitHub contents API. Never fatal."""
+    url = f"https://api.github.com/repos/{_repo()}/contents/{HISTORY_PATH}"
+    try:
+        req = urllib.request.Request(url, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+        blob = json.loads(base64.b64decode(d.get("content") or "").decode())
+        entries = blob.get("entries", []) if isinstance(blob, dict) else []
+        log(f"  history loaded: {len(entries)} previously used stories")
+        return entries
+    except Exception as e:
+        log(f"  history read failed ({e}) - treating as empty")
+        return []
+
+
+def record_history(body, items, today_uk, history):
+    """Append the stories actually published today to state/history.json."""
+    if not os.environ.get("GITHUB_TOKEN"):
+        log("  no GITHUB_TOKEN - cannot record used-story history")
+        return False
+    used_links = re.findall(r"^Link:\s*(\S+)\s*$", body, re.MULTILINE)
+    by_link = {it["link"]: it for it in items if it.get("link")}
+    new = []
+    for link in used_links:
+        it = by_link.get(link)
+        title = it["title"] if it else link
+        new.append({"key": title_key(title), "title": title,
+                    "link": link, "date": today_uk})
+    if not new:
+        log("  no links found in the bulletin - history not updated")
+        return False
+
+    cutoff = datetime.now(timezone.utc).timestamp() - HISTORY_KEEP_DAYS * 86400
+    keep = []
+    for h in list(history) + new:
+        try:
+            d = datetime.strptime(h.get("date", ""), "%Y-%m-%d")
+        except Exception:
+            d = None
+        if d is not None and d.replace(tzinfo=timezone.utc).timestamp() < cutoff:
+            continue
+        keep.append(h)
+    # De-duplicate by key, newest wins.
+    dedup = {}
+    for h in keep:
+        dedup[h.get("key") or title_key(h.get("title", ""))] = h
+    payload = json.dumps({"updated": today_uk, "entries": list(dedup.values())},
+                         indent=1, ensure_ascii=False)
+
+    _, sha = _read_history_sha()
+    url = f"https://api.github.com/repos/{_repo()}/contents/{HISTORY_PATH}"
+    body_req = {"message": f"Record stories used {today_uk}",
+                "content": base64.b64encode(payload.encode()).decode()}
+    if sha:
+        body_req["sha"] = sha
+    try:
+        req = urllib.request.Request(url, data=json.dumps(body_req).encode(),
+                                     headers=_gh_headers(), method="PUT")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            ok = r.status in (200, 201)
+        log(f"  OK history updated ({len(new)} stories, {len(dedup)} total)")
+        return ok
+    except Exception as e:
+        log(f"  history write failed ({e})")
+        return False
+
+
+def _read_history_sha():
+    url = f"https://api.github.com/repos/{_repo()}/contents/{HISTORY_PATH}"
+    try:
+        req = urllib.request.Request(url, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return None, json.loads(r.read().decode()).get("sha")
+    except Exception:
+        return None, None
+
+
+def get_headlines(history=None):
     """All feeds merged round-robin (so the first N span every source, not just
-    the first feed or two), de-duplicated by title, with anything heavy dropped
-    before the model ever sees it."""
+    the first feed or two), de-duplicated by title, with anything heavy, stale
+    or already used in a previous bulletin dropped before the model sees it."""
+    history = history or []
     per_feed = []
     for name, url in NEWS_FEEDS:
         per_feed.append(fetch_feed(name, url))
-    seen, merged, dropped = set(), [], 0
+    seen, merged = set(), []
+    dropped, stale, repeats = 0, 0, 0
     for i in range(max((len(f) for f in per_feed), default=0)):
         for feed in per_feed:
             if i >= len(feed):
@@ -221,8 +396,17 @@ def get_headlines():
             if is_heavy(item):
                 dropped += 1
                 continue
+            age = item_age_hours(item)
+            if age is not None and age > MAX_AGE_HOURS:
+                stale += 1
+                continue
+            if is_repeat(item, history):
+                repeats += 1
+                continue
             merged.append(item)
     log(f"  {dropped} heavy/serious headlines filtered out")
+    log(f"  {stale} stale headlines dropped (older than {MAX_AGE_HOURS}h)")
+    log(f"  {repeats} already-used headlines dropped (last {REPEAT_WINDOW_DAYS} days)")
     return merged
 
 
@@ -246,8 +430,11 @@ keep them company - he is NOT a newsreader. His style: REALLY AUTHENTIC, REALLY 
 CONVERSATIONAL, warm, understated, dry-witted. Sounds like a mate chatting, never \
 like a newsreader or a press release.
 
-Below are today's real headlines. Pick the FIVE best stories for him to talk about \
-on air today, and write them up.
+Below are today's real headlines - all published in the last three days, and every \
+one of them is fresh: nothing he has already had in an earlier bulletin is in this \
+list. Pick the FIVE best stories for him to talk about on air today, and write them \
+up. Five DIFFERENT subjects please - five versions of the same showbiz story is a \
+weak bulletin.
 
 THE RULE ABOVE ALL OTHERS - AUTHENTICITY. Every line must sound like something he \
 would actually say out loud to ONE listener, sitting in a studio, on a Saturday. \
@@ -378,8 +565,17 @@ def call_llm(items, attempts=3):
             choice = d["choices"][0]
             content = (choice.get("message") or {}).get("content")
             if content and content.strip():
-                return content.strip()
-            last_err = f"empty content (finish_reason={choice.get('finish_reason')})"
+                body = content.strip()
+                # The model sometimes ignores the '---' separators or fuses
+                # stories together. Catch it here and retry, rather than
+                # publishing a bulletin whose header says "One things".
+                found = len(split_stories(clean_body(body)))
+                if found >= 4:
+                    return body
+                last_err = f"only {found} parseable stories"
+                log(f"  LLM returned {found} parseable stories (want {STORIES}) - retrying")
+            else:
+                last_err = f"empty content (finish_reason={choice.get('finish_reason')})"
         except Exception as e:
             last_err = str(e)
         log(f"  LLM attempt {i + 1} failed: {last_err}")
@@ -432,14 +628,38 @@ def clean_body(text):
 
 
 def split_stories(body):
-    """Split into story blocks on the '---' separator the prompt asks for."""
-    parts = re.split(r"\n\s*-{3,}\s*\n", body)
-    blocks = [p.strip() for p in parts if p.strip()]
-    # Fallback: if the model ignored the separator, split on the numbered headers.
-    if len(blocks) <= 1:
-        blocks = re.split(r"\n(?=\d+\.\s+[A-Z])", body)
-        blocks = [b.strip() for b in blocks if b.strip()]
-    return blocks
+    """Split into story blocks.
+
+    The prompt asks the model for '---' separators, but it drops them often, so
+    the numbered header ('3. [12] HEADLINE') is the reliable delimiter. Note the
+    OPTIONAL [n] tag - the model usually keeps it, and a naive '[A-Z]' pattern
+    misses '2. [17] EX-PREMIER...', which silently collapsed the whole bulletin
+    into one story (header read "One things doing the rounds today", only one
+    link got attached).
+    """
+    by_header = re.split(r"\n(?=\d+\.\s*(?:\[\d+\]\s*)?[A-Z])", body)
+    by_header = [b.strip() for b in by_header if b.strip()]
+    by_rule = re.split(r"\n\s*-{3,}\s*\n", body)
+    by_rule = [b.strip() for b in by_rule if b.strip()]
+    blocks = by_header if len(by_header) >= len(by_rule) else by_rule
+    # Drop any preamble the model wrote before the first numbered story.
+    if len(blocks) > 1 and not re.match(r"^\d+\.", blocks[0]):
+        blocks = blocks[1:]
+    # Strip separator-only lines from the edges of every block. Without this a
+    # block keeps the '---' that followed it, and because drop_heavy_blocks /
+    # apply_brief / linkify each re-split and re-join with '---', the separators
+    # accumulate into empty "stories" ("2. ---") on every pass.
+    cleaned = []
+    for b in blocks:
+        lines = b.split("\n")
+        while lines and re.fullmatch(r"\s*-{3,}\s*", lines[0]):
+            lines.pop(0)
+        while lines and re.fullmatch(r"\s*-{3,}\s*", lines[-1]):
+            lines.pop()
+        b = "\n".join(lines).strip()
+        if b:
+            cleaned.append(b)
+    return cleaned
 
 
 # Fabricated autobiography: the model likes inventing "my mum..." / "I once..."
@@ -693,7 +913,8 @@ def main():
         log(f"In window (hour={h}), not yet sent today - sending.")
 
     log("Fetching feeds...")
-    items = get_headlines()
+    history = load_history()
+    items = get_headlines(history)
     log(f"  {len(items)} unique headlines collected")
     if not items:
         raise RuntimeError("no headlines fetched - all feeds down")
@@ -740,6 +961,10 @@ def main():
 
     if _write_marker(today_uk):
         log(f"  OK marker written for {today_uk}")
+    try:
+        record_history(body, items, today_uk, history)
+    except Exception as e:
+        log(f"  ERROR recording used-story history: {e}")
     log("DONE")
     if email_err is not None:
         raise RuntimeError(f"email delivery failed: {email_err}")
