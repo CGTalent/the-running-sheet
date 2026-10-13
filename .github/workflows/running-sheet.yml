@@ -1,7 +1,8 @@
 name: The Running Sheet
 
-# Fires at 06:00, 07:00, 08:00 and 09:00 UTC - four attempts, because GitHub's
-# scheduler can delay a run by hours. post.py reads UK local time itself and
+# Fires six times an hour from 06:00 to 11:59 UTC - 36 attempts, always off the
+# top of the hour, because GitHub's scheduler delays runs by hours or drops
+# them outright (the old top-of-the-hour slots were the worst offenders). post.py reads UK local time itself and
 # sends on the first run landing 07:00-18:59 UK, so the bulletin normally
 # arrives at 7 AM UK all year round (DST-safe) but still goes out if GitHub
 # delays the early runs.
